@@ -1,0 +1,7 @@
+# 编译产物
+/server
+/client
+*.o
+
+# macOS
+.DS_Store
