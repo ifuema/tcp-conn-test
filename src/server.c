@@ -16,18 +16,23 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <signal.h>
 #include <time.h>
 #include <stdint.h>
 #include <stdarg.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <sys/resource.h>
+
+#ifdef _WIN32
+#  include "wincompat.h"   /* 必须最先包含: 拉入 winsock2.h 并把 WSA 错误翻译成 errno */
+#else
+#  include <unistd.h>
+#  include <fcntl.h>
+#  include <signal.h>
+#  include <netdb.h>
+#  include <netinet/in.h>
+#  include <netinet/tcp.h>
+#  include <arpa/inet.h>
+#  include <sys/socket.h>
+#  include <sys/resource.h>
+#endif
 #if defined(__APPLE__) || defined(__FreeBSD__)
 #  include <sys/sysctl.h>
 #endif
@@ -89,16 +94,24 @@ static int g_cur = 0, g_peak = 0, g_max_fd_seen = 0;
 
 static uint64_t now_us(void)
 {
+#if defined(_WIN32)
+    return nb_now_us();
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)(ts.tv_nsec / 1000);
+#endif
 }
 
 static int set_nonblock(int fd)
 {
+#if defined(_WIN32)
+    return nb_set_nonblock(fd);
+#else
     int fl = fcntl(fd, F_GETFL, 0);
     if (fl < 0) return -1;
     return fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+#endif
 }
 
 /* 解析端口规格: "8000" / "8000,8001" / "8000-8010" / "8000-8010,9000" */
@@ -159,10 +172,28 @@ static int read_somaxconn(void)
     size_t len = sizeof(val);
     if (sysctlbyname("kern.ipc.somaxconn", &val, &len, NULL, 0) == 0) v = val;
 #endif
+    /* Windows: 自 Win8/Server2012 起 listen backlog 由系统动态管理
+       (SOMAXCONN 即 0x7FFFFFFF), 没有可读的限制值, 返回 -1 由调用方说明。 */
     return v;
 }
 
 static void on_signal(int sig) { (void)sig; g_quit = 1; }
+
+#if defined(_WIN32)
+static BOOL WINAPI win_ctrl_handler(DWORD type)
+{
+    switch (type) {
+    case CTRL_C_EVENT:
+    case CTRL_BREAK_EVENT:
+    case CTRL_CLOSE_EVENT:
+        on_signal(SIGINT);
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+#endif
+
 
 /* 把一个已 accept 的 fd 纳入管理 */
 static void setup_conn(int fd)
@@ -173,6 +204,9 @@ static void setup_conn(int fd)
     int on = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
     if (!cfg.no_keepalive) {
+#if defined(_WIN32)
+        nb_set_keepalive(fd, 1, cfg.ka_idle, 30);
+#else
         setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
 #ifdef TCP_KEEPIDLE
         int idle = cfg.ka_idle;
@@ -181,6 +215,7 @@ static void setup_conn(int fd)
 #ifdef TCP_KEEPINTVL
         int intvl = 30;
         setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+#endif
 #endif
     }
     /* 关键: 百万连接时, 默认 16KB~64KB 的收发缓冲会直接吃光内存。
@@ -283,6 +318,13 @@ static void print_progress(uint64_t now, uint64_t start)
 int main(int argc, char **argv)
 {
     int opt;
+
+#if defined(_WIN32)
+    if (nb_wsa_init() != 0) {
+        fprintf(stderr, "WSAStartup 失败: %d\n", WSAGetLastError());
+        return 1;
+    }
+#endif
     const char *portspec = "8000";
 
     while ((opt = getopt(argc, argv, "b:p:eB:R:S:kK:q?")) != -1) {
@@ -307,10 +349,19 @@ int main(int argc, char **argv)
         return 1;
     }
 
+#if defined(_WIN32)
+    SetConsoleCtrlHandler(win_ctrl_handler, TRUE);
+#else
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
+#endif
 
+#if defined(_WIN32)
+    printf("连接数上限      : %d (Windows select 后端, 由 NB_WIN_FD_SETSIZE 决定)\n",
+           NB_WIN_MAX_CONNS);
+    fprintf(stderr, "[提示] Windows 原生版适合几千到一两万连接; 更大规模请用 WSL2。\n");
+#else
     struct rlimit rl;
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
         printf("RLIMIT_NOFILE: soft=%llu hard=%llu\n",
@@ -319,6 +370,7 @@ int main(int argc, char **argv)
             fprintf(stderr, "[提示] soft nofile 偏低(%llu), 建议先执行: ulimit -n 1048576\n",
                     (unsigned long long)rl.rlim_cur);
     }
+#endif
 
     if (nb_ev_create(&g_loop, 8192) < 0) {
         perror("ev_create");
@@ -332,9 +384,14 @@ int main(int argc, char **argv)
         if (fd < 0) { perror("socket"); return 1; }
 
         int on = 1;
+#ifdef _WIN32
+        /* Windows 的 SO_REUSEADDR 允许抢占他人端口(安全隐患), 服务端用独占绑定 */
+        setsockopt(fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, &on, sizeof(on));
+#else
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
-#ifdef SO_REUSEPORT
+#  ifdef SO_REUSEPORT
         setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
+#  endif
 #endif
         set_nonblock(fd);
 

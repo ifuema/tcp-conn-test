@@ -9,7 +9,8 @@
 
 ## 特性
 
-- **单进程单线程 + 非阻塞 IO**（Linux epoll / macOS kqueue），无第三方依赖，可撑百万连接
+- **单进程单线程 + 非阻塞 IO**（Linux epoll / macOS kqueue / Windows select），
+  无第三方依赖，Linux/macOS 下可撑百万连接
 - **两种模式**：`conn` 测并发容量、`cps` 测每秒新建速率，各自输出结论与归因
 - **自动触顶判定**：存活数长时间不净增长就自动停止并出报告，不用守着按 Ctrl-C
 - **能识别三种触顶形态**：SYN 静默丢弃 / 会话表满后踢旧建新 / NAT 空闲超时悄悄掉线
@@ -25,10 +26,12 @@
 tcp-conn-test/
 ├── Makefile            # make 即可，零依赖
 ├── src/
-│   ├── ev.h            # 跨平台事件循环封装（Linux epoll / macOS-BSD kqueue）
+│   ├── ev.h            # 跨平台事件循环（Linux epoll / macOS-BSD kqueue / Windows select）
+│   ├── wincompat.h     # Windows 兼容层（WSA 错误翻译、非阻塞、keepalive、getopt）
 │   ├── server.c        # 受端：多端口监听、discard 模式、低内存占用
 │   └── client.c        # 压测端：定速建连、连接保持、心跳探测、失败归因
 ├── tune.sh             # 测试前的系统参数调优（Linux / macOS）
+├── tune.ps1            # 同上，Windows 版（管理员 PowerShell）
 └── README.md
 ```
 
@@ -39,7 +42,9 @@ make            # 产出 ./server 和 ./client
 make clean
 ```
 
-仅用 C 标准库，无第三方依赖，Linux 与 macOS 均可直接编译。
+仅用 C 标准库，无第三方依赖。Linux、macOS、Windows 三平台均支持；
+Windows 需要 MinGW/Clang 工具链，或在别的系统上 `make windows` 交叉编译，
+详见「在 Windows 上运行」。
 
 ---
 
@@ -61,6 +66,193 @@ bash -c 'ulimit -n 1048576 && ./client -s 10.0.0.2 -p 8000-8031 -c 1000000 -r 20
 
 `-r 200` 表示每秒只新建 200 条连接 —— 慢，但只有这样测出来的才是并发容量。
 程序会每秒打印一次进度，触顶后自动停止并输出完整报告；`Ctrl-C` 也能随时中断并照常出报告。
+
+---
+
+## 在 Windows 上运行
+
+三条路线，按推荐顺序：
+
+| 路线                        | 适合场景                    | 连接数上限                    | 说明                       |
+| ------------------------- | ----------------------- | ------------------------ | ------------------------ |
+| **WSL2**（推荐）               | 一切场景，尤其是上万连接            | 同 Linux（几十万）             | 走原生 epoll，功能与 Linux 完全一致 |
+| **原生编译**（.exe）            | 只要一个 exe、目标在万级以内        | `NB_WIN_FD_SETSIZE`（默认 8192） | select 后端，见下方限制      |
+| **Docker**                | 已有 Docker Desktop        | 同 Linux                  | 注意端口映射会再套一层 NAT          |
+
+### 五分钟跑通
+
+不管用哪条路线，跑完一次测试都是下面这几步。以原生 `.exe` 为例（WSL2 把
+`.\server.exe` 换成 `./server`、跳过 `tune.ps1` 改用 `sudo ./tune.sh` 即可）：
+
+```powershell
+# 1) 被压测机：管理员 PowerShell 先调优（Windows 必做，默认动态端口只有 16384 个）
+.\tune.ps1
+
+# 2) 被压测机：放行入站，否则客户端只会看到超时
+New-NetFirewallRule -DisplayName "tcp-conn-test" -Direction Inbound `
+  -Protocol TCP -LocalPort 8000-8031 -Action Allow
+
+# 3) 被压测机：起服务端（多端口能扩大四元组空间，建议至少 16 个）
+.\server.exe -p 8000-8031
+
+# 4) 压测机（必须是另一台机器）：先小规模试通
+.\client.exe -s <服务端IP> -p 8000-8031 -c 2000 -r 200
+
+# 5) 压测机：正式测 —— 目标值给到预期上限的 2 倍，让它自然撞墙后自动出报告
+.\client.exe -s <服务端IP> -p 8000-8031 -c 2000000 -r 200
+```
+
+看到 `结束原因` / `【结论】` / `【原因】` 三段就是跑完了；中途按 `Ctrl-C` 也会照常输出报告。
+参数含义与 Linux 版完全一致，见「参数手册」。
+
+### 路线一：WSL2（推荐）
+
+```powershell
+wsl --install -d Ubuntu
+```
+
+进入 WSL 后按 Linux 的方式编译运行：
+
+```bash
+sudo apt update && sudo apt install -y build-essential
+git clone <你的仓库地址> && cd tcp-conn-test
+make
+bash -c 'ulimit -n 1048576 && ./client -s 10.0.0.2 -p 8000-8031 -c 100000 -r 200'
+```
+
+注意两点：
+
+- **不要把源码放在 `/mnt/c` 下编译**，跨文件系统 IO 很慢；放到 WSL 自己的家目录里。
+- **WSL2 自带一层 NAT**（Hyper-V 虚拟交换机）。如果目标是测物理网卡那条链路的上限，
+  WSL2 的 NAT 会话表也会成为瓶颈，判定瓶颈位置时要把它算进去；
+  如果只是用 Windows 当压测客户端去测服务端容量，则完全没问题。
+
+### 路线二：原生 Windows 版（.exe）
+
+**方式 A：在 Windows 上直接编译（MSYS2）**
+
+```powershell
+winget install MSYS2.MSYS2
+```
+
+打开 **MSYS2 UCRT64** 终端：
+
+```bash
+pacman -S --needed mingw-w64-ucrt-x86_64-gcc make
+cd /c/path/to/tcp-conn-test
+make                      # 产出 server.exe / client.exe
+```
+
+**方式 B：在 Linux/macOS 上交叉编译，把 exe 拷过去**
+
+```bash
+# 用 zig（自带 mingw 头文件与导入库，不用另装工具链）
+make windows WINCC="zig cc -target x86_64-windows-gnu"
+
+# 或已装 MinGW-w64 的情况（macOS: brew install mingw-w64）
+make windows WINCC="x86_64-w64-mingw32-gcc"
+```
+
+产出 `build-windows/server.exe` 与 `build-windows/client.exe`（PE32+ x86-64，
+拷到 Windows 直接双击或用 PowerShell 运行即可，无需任何运行时依赖）。
+该目录已在 `.gitignore` 中 —— 二进制不随仓库分发，请自行编译。
+
+> 本项目的 Windows 版就是用 `zig cc -target x86_64-windows-gnu`（zig 0.14.1）
+> 交叉编译验证的：**编译零警告**，产物为 PE32+ x86-64。
+
+**运行**（PowerShell 或 CMD，参数与 Linux 版完全一致）：
+
+```powershell
+.\server.exe -p 8000-8031
+.\client.exe -s 10.0.0.2 -p 8000-8031 -c 5000 -r 200
+```
+
+**Windows 系统调优**（管理员 PowerShell，对应 `tune.sh`）：
+
+```powershell
+.\tune.ps1               # 动态端口扩到 1025-65534, TIME_WAIT 降到 30 秒
+.\tune.ps1 -Revert       # 恢复 Windows 默认值
+```
+
+Windows 默认的动态端口范围只有 `49152-65535`（16384 个），客户端在一万多条就会
+撞到端口耗尽，所以这一步在 Windows 上比 Linux 更必要。
+
+**Windows 防火墙**：服务端需要放行入站，否则客户端只会看到超时：
+
+```powershell
+New-NetFirewallRule -DisplayName "tcp-conn-test" -Direction Inbound `
+  -Protocol TCP -LocalPort 8000-8031 -Action Allow
+```
+
+### Windows 原生版的差异与限制
+
+| 项目           | Linux / macOS            | Windows 原生版                                        |
+| ------------- | ------------------------ | -------------------------------------------------- |
+| 事件循环         | epoll / kqueue           | **select**（Windows 没有 epoll/kqueue）                 |
+| 连接数上限        | 内存与 fd 决定（百万级）           | **`NB_WIN_FD_SETSIZE`，默认 8192**                     |
+| fd 上限概念      | `ulimit -n`              | 无，启动时打印 select 后端的上限                                |
+| TCP keepalive | `TCP_KEEPIDLE`           | `SIO_KEEPALIVE_VALS`（`-k` / `-K` 同样有效）               |
+| listen backlog | 受 `somaxconn` 限制并告警      | Win8+ 由系统动态管理，不再告警                                  |
+| 端口复用         | `SO_REUSEADDR`           | 服务端改用 `SO_EXCLUSIVEADDRUSE`（Windows 的 SO_REUSEADDR 允许抢占他人端口） |
+| 中断信号         | `SIGINT` / `SIGTERM`     | 控制台 Ctrl Handler（Ctrl-C / 关闭窗口都会正常出报告）             |
+| 编译器          | cc / gcc / clang         | MinGW-w64、Clang；**MSVC (cl.exe) 未适配**              |
+
+> 为什么不用 IOCP？IOCP 是完成端口模型（proactor），与本项目 reactor 式的事件循环
+> 结构差异很大，接进来等于重写一遍事件层。为了保持**一份可读的跨平台代码**，
+> Windows 侧选了语义最接近的 select。需要 Windows 上跑十万级连接时，用 WSL2 更划算。
+
+**select 后端意味着什么：** `select()` 每次调用都要线性扫描整个 fd 集合，是 O(n)。
+在 8192 这一档，客户端自身 CPU 会先于链路成为瓶颈，**测出来的数字不代表真实容量**。
+所以：
+
+- 目标在几千到一两万、只是想快速验证：原生版够用
+- 要测真实上限：**用 WSL2**，或把 `NB_WIN_FD_SETSIZE` 调大重新编译
+  （同时记得 select 的 O(n) 开销也会同步放大）：
+
+```bash
+make windows WINCC="zig cc -target x86_64-windows-gnu" \
+     CFLAGS="-O2 -Wall -Wextra -std=c11 -DNB_WIN_FD_SETSIZE=32768"
+```
+
+> 说明：Windows 的 `fd_set` 是 fd 列表而非位图，`FD_SET` 直接把 SOCKET 追加进数组，
+> 因此不受「fd 数值必须小于 FD_SETSIZE」的限制，`FD_SETSIZE` 限制的是**条数**。
+> 本项目的 select 后端也据此用 `(fd, mask)` 数组维护关注列表，不按 fd 数值建索引。
+
+### 路线三：Docker
+
+```powershell
+docker run --rm -it --network host -v ${PWD}:/src -w /src gcc:13 bash -c "make && ./client ..."
+```
+
+`--network host` 在 Docker Desktop 上走的是虚拟机的网络栈，同样会多一层 NAT；
+对结果要求严格时优先用 WSL2。
+
+### Windows 排查速查
+
+**命令对照** —— README 后面各节的排查命令都能在 Windows 上找到等价物：
+
+| 用途         | Linux / macOS                        | Windows                                                  |
+| ---------- | ------------------------------------ | -------------------------------------------------------- |
+| 本机内网 IP    | `ipconfig getifaddr en0`             | `ipconfig`                                               |
+| 公网出口 IP    | `curl -s ifconfig.me`                | `curl.exe -s ifconfig.me`                                |
+| 看第 2 跳是否 CGNAT | `traceroute -m 4 223.5.5.5`    | `tracert -h 4 -w 1000 223.5.5.5`                         |
+| 当前 ESTABLISHED 数 | `ss -s`                        | `(netstat -an \| Select-String ESTABLISHED).Count`        |
+| TIME_WAIT 数量 | `ss -s`                           | `(netstat -an \| Select-String TIME_WAIT).Count`          |
+| 动态端口范围     | `sysctl net.ipv4.ip_local_port_range` | `netsh int ipv4 show dynamicport tcp`                    |
+| 连接数上限      | `ulimit -n`                          | 无 —— 原生版受 `NB_WIN_FD_SETSIZE` 限制                          |
+
+**常见报错**：
+
+| 现象                              | 原因                        | 处理                                                  |
+| ------------------------------- | ------------------------- | --------------------------------------------------- |
+| `探测连接失败: Connection refused`     | 服务端没起，或防火墙拦了              | 先确认 `.\server.exe` 在跑，再查入站规则                        |
+| 客户端一直 `超时`、`存活` 不涨              | 服务端防火墙未放行（Windows 默认拦入站）   | 执行上面的 `New-NetFirewallRule`                          |
+| `Can't assign requested address` 持续增长 | 动态端口耗尽（Windows 默认只有 16384 个） | 管理员执行 `.\tune.ps1`                                   |
+| 存活卡在 8192 附近不动                  | select 后端上限               | 加大 `NB_WIN_FD_SETSIZE` 重编译，或改用 WSL2                    |
+| 报告里出现 `Unknown error`           | 旧版未翻译 Winsock 错误码          | 用当前版本（`SO_ERROR` 已翻译成 errno）                          |
+| 控制台中文乱码                         | 代码页不是 UTF-8               | 先执行 `chcp 65001`                                     |
+| 双击 exe 一闪而过                     | 缺参数，程序直接退出                | 在 PowerShell / CMD 里带参数运行                            |
+| 下载的 exe 被拦或提示来源不明               | SmartScreen / 杀软对未签名程序     | 右键属性勾「解除锁定」，或自行从源码编译                                 |
 
 ---
 
@@ -280,9 +472,17 @@ bash -c 'ulimit -n 1048576 && ./client -s 10.0.0.2 -p 8000-8031 -c 1000000 -r 20
 对比**本机内网 IP** 与 **公网出口 IP**，更重要的是看 **traceroute 第 2 跳**：
 
 ```bash
+# Linux / macOS
 ipconfig getifaddr en0            # 本机内网 IP（Linux: ip addr | grep inet）
 curl -s --max-time 8 ifconfig.me  # 公网出口（先 env | grep -i proxy 确认没走代理）
 traceroute -m 4 -w 1 -q 1 223.5.5.5
+```
+
+```powershell
+# Windows
+ipconfig                          # 本机内网 IP
+curl.exe -s ifconfig.me           # 公网出口
+tracert -h 4 -w 1000 223.5.5.5    # 看前 4 跳
 ```
 
 第 2 跳落在 `100.64.0.0/10`（RFC 6598 运营商级 NAT 专用段）就是 CGNAT。
@@ -314,7 +514,8 @@ traceroute -m 4 -w 1 -q 1 223.5.5.5
 「服务端真的发了」。用服务端进度行的 `当前 / close累计` 与客户端对拍：
 
 - **服务端 `close累计` ≈ 客户端 `对端关闭`、`当前` ≈ 客户端 `存活`**
-  → 关闭确实发生在服务端：查 accept 队列溢出（`netstat -s | grep -i listen`）、
+  → 关闭确实发生在服务端：查 accept 队列溢出（Linux：`netstat -s | grep -i listen`；
+  Windows：`netstat -s -p tcp` 看 `Failed Connection Attempts` / `Reset Connections`）、
   `tcp_abort_on_overflow`、进程是否被 OOM 杀掉（`dmesg | grep -i kill`）
 - **服务端 `当前` 明显大于客户端 `存活`**（服务端以为连接还活着）
   → FIN/RST 是**链路中间设备伪造的** → CGNAT 会话回收或云厂商防护实锤
@@ -393,6 +594,17 @@ sudo ifconfig eth0:1 10.0.0.5 netmask 255.255.255.0 up
 - 存活数存在常态抖动，`-G` 用「净增长 + 容忍阈值」判定，极端抖动场景下可能多等一个窗口。
 - 心跳是全量轮询分摊（`-P` 限制每秒探测条数），超百万连接时单轮心跳周期会被拉长，
   形态 C 的发现延迟会变大。
+- **Windows 原生版用 select 后端，是 O(n) 扫描**，默认上限 8192 条（`NB_WIN_FD_SETSIZE`），
+  上万条时客户端自身 CPU 会先吃紧。要测真实上限请用 WSL2。
+- Windows 原生版的验证程度：**交叉编译通过、零警告**，且事件循环（select 后端）
+  已在 macOS 上以 `-DNB_FORCE_SELECT` 强制走同一套代码路径跑通真实测试
+  （建连、心跳、CPS 模式、踢旧建新判定均正常）；
+  但 Winsock 相关部分（WSA 错误翻译、`SIO_KEEPALIVE_VALS`、控制台 Ctrl Handler、
+  `SO_EXCLUSIVEADDRUSE`）**尚未在真实 Windows 上跑过** —— 首次在 Windows 上运行时
+  请留意启动阶段的输出是否正常。
+- 原生 Windows 版的容量估算按 16384 个动态端口计算（Windows 默认值），
+  跑过 `tune.ps1` 之后端口范围已扩大，但程序不做二次探测，估算值会偏保守。
+- MSVC (`cl.exe`) 未适配（缺 `getopt` 等 POSIX 接口），请用 MinGW-w64 / Clang 或 WSL2。
 
 ---
 
@@ -403,8 +615,12 @@ sudo ifconfig eth0:1 10.0.0.5 netmask 255.255.255.0 up
   测出来的数字没有参考价值。
 - `ulimit` 只对当前 shell 及其子进程生效，务必和启动命令写在一起：
   `bash -c 'ulimit -n 1048576 && ./client ...'`
-- `tune.sh` 的改动重启后失效，需要持久化请自行写入 `/etc/sysctl.conf`。
-- 测试结束后会留下大量 `TIME_WAIT`，属正常现象，可通过
-  `ss -s`（Linux）或 `netstat -an | wc -l` 观察回收情况。
+- `tune.sh` 的改动重启后失效，需要持久化请自行写入 `/etc/sysctl.conf`；
+  Windows 的 `tune.ps1` 相反 —— **改的是注册表，重启后保留**，恢复请执行 `.\tune.ps1 -Revert`。
+- Windows 没有 `ulimit`，原生版的连接数上限由 `NB_WIN_FD_SETSIZE` 决定（默认 8192），
+  程序启动时会打印实际值。
+- 测试结束后会留下大量 `TIME_WAIT`，属正常现象，可通过 `ss -s`（Linux）、
+  `netstat -an | wc -l`（macOS）或 `(netstat -an | Select-String TIME_WAIT).Count`（Windows）
+  观察回收情况。
 - `syncookies` 建议测试期间关闭：它会掩盖真实的队列溢出问题，
   让「丢连接」看起来像「建连成功」。`tune.sh` 已处理。

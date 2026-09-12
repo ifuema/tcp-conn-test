@@ -21,18 +21,23 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <signal.h>
 #include <time.h>
 #include <stdint.h>
-#include <poll.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <sys/resource.h>
+
+#ifdef _WIN32
+#  include "wincompat.h"   /* 必须最先包含: 拉入 winsock2.h 并把 WSA 错误翻译成 errno */
+#else
+#  include <unistd.h>
+#  include <fcntl.h>
+#  include <signal.h>
+#  include <poll.h>
+#  include <netdb.h>
+#  include <netinet/in.h>
+#  include <netinet/tcp.h>
+#  include <arpa/inet.h>
+#  include <sys/socket.h>
+#  include <sys/resource.h>
+#endif
 
 #include "ev.h"
 
@@ -222,22 +227,46 @@ static uint64_t g_loop_batch_sum = 0; /* 累计实际发起条数 */
 
 static uint64_t now_us(void)
 {
+#if defined(_WIN32)
+    return nb_now_us();
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)(ts.tv_nsec / 1000);
+#endif
 }
 
 static int set_nonblock(int fd)
 {
+#if defined(_WIN32)
+    return nb_set_nonblock(fd);
+#else
     int fl = fcntl(fd, F_GETFL, 0);
     if (fl < 0) return -1;
     return fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+#endif
 }
 
 static void on_signal(int sig)
 {
     if (sig == SIGINT || sig == SIGTERM) g_sigint = 1;
 }
+
+#if defined(_WIN32)
+/* Windows 没有 SIGINT 的控制台语义, 用 Ctrl Handler 接住 Ctrl-C / 关闭窗口 */
+static BOOL WINAPI win_ctrl_handler(DWORD type)
+{
+    switch (type) {
+    case CTRL_C_EVENT:
+    case CTRL_BREAK_EVENT:
+    case CTRL_CLOSE_EVENT:
+        on_signal(SIGINT);
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+#endif
 
 /* -------------------- 解析 -------------------- */
 static int parse_ports(const char *s, int *out, int maxn)
@@ -602,6 +631,10 @@ static int start_conn(void)
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
     if (cfg.keepalive) {
+#if defined(_WIN32)
+        /* Windows 没有 TCP_KEEPIDLE, 走 SIO_KEEPALIVE_VALS */
+        nb_set_keepalive(fd, 1, cfg.ka_idle, 30);
+#else
         setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
 #ifdef TCP_KEEPIDLE
         int idle = cfg.ka_idle;
@@ -610,6 +643,7 @@ static int start_conn(void)
 #ifdef TCP_KEEPINTVL
         int intvl = 30;
         setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+#endif
 #endif
     }
     /* CPS 模式是短连接, 调缓冲没有意义(连上就关), 省掉两次系统调用以提升新建速率 */
@@ -697,8 +731,14 @@ static void handle_event(int fd, int mask)
 
     if (c->state == ST_CONNECTING) {
         int err = 0;
+#if defined(_WIN32)
+        /* Windows 的 SO_ERROR 返回 WSA 错误码(如 10061), 必须翻译成 errno,
+           否则下面的失败归因(超时/拒绝/重置/端口耗尽)会全部落空。 */
+        if (nb_so_error(fd, &err) < 0) err = errno;
+#else
         socklen_t len = sizeof(err);
         if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0) err = errno;
+#endif
         if (err == 0) {
             on_connect_ok(c);
         } else {
@@ -772,16 +812,33 @@ static int probe_once(void)
         close(fd);
         return -1;
     }
+#if defined(_WIN32)
+    /* 这里刻意用 select 而不是 WSAPoll: WSAPoll 在连接失败时不回报 POLLERR
+       (微软的已知问题), 会把「服务端没起 / 端口不通」误报成「连接超时」,
+       而这正是启动探测最需要区分的一件事。 */
+    fd_set wf, ef;
+    FD_ZERO(&wf);
+    FD_ZERO(&ef);
+    FD_SET((SOCKET)fd, &wf);
+    FD_SET((SOCKET)fd, &ef);
+    struct timeval tv = { 3, 0 };
+    int r = select(0, NULL, &wf, &ef, &tv);
+#else
     struct pollfd pfd = { .fd = fd, .events = POLLOUT };
     int r = poll(&pfd, 1, 3000);
+#endif
     if (r <= 0) {
         fprintf(stderr, "探测连接超时(3s), 请确认服务端可达\n");
         close(fd);
         return -1;
     }
     int err = 0;
+#if defined(_WIN32)
+    if (nb_so_error(fd, &err) < 0 || err != 0) {
+#else
     socklen_t len = sizeof(err);
     if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
+#endif
         fprintf(stderr, "探测连接失败: %s\n", strerror(err ? err : errno));
         close(fd);
         return -1;
@@ -1363,6 +1420,16 @@ static void print_report(void)
 /* 给出本机容量方面的提示 */
 static void env_hints(void)
 {
+#if defined(_WIN32)
+    /* Windows 没有 RLIMIT_NOFILE, 实际上限由 select 后端的 FD_SETSIZE 决定 */
+    unsigned long long cur = (unsigned long long)NB_WIN_MAX_CONNS;
+    printf("连接数上限      : %llu (Windows select 后端, 由 NB_WIN_FD_SETSIZE 决定)\n", cur);
+    if ((unsigned long long)cfg.max_conns > cur)
+        fprintf(stderr,
+            "[警告] 目标连接数 %d 超过 Windows 原生版上限 %llu。\n"
+            "       处理: 用 -DNB_WIN_FD_SETSIZE=<更大值> 重新编译, 或改用 WSL2。\n",
+            cfg.max_conns, cur);
+#else
     struct rlimit rl;
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
         printf("RLIMIT_NOFILE: soft=%llu hard=%llu\n",
@@ -1374,26 +1441,56 @@ static void env_hints(void)
                 "       先执行: ulimit -n %d\n",
                 (unsigned long long)rl.rlim_cur, cfg.max_conns, cfg.max_conns + 1024);
     }
+#endif
 
-    /* 估算四元组容量 */
-    long long quad = (long long)(cfg.nsrcs ? cfg.nsrcs : 1) * 60000LL * (long long)cfg.nports;
-    printf("四元组理论容量  : 约 %lld (源IP %d × 本地端口 ~60000 × 目标端口 %d)\n",
-           quad, cfg.nsrcs ? cfg.nsrcs : 1, cfg.nports);
+    /* 估算四元组容量。
+       本地端口数必须按平台取: Linux/macOS/Windows 的默认动态端口范围完全不同,
+       统一按 6 万估算会在 macOS/Windows 上严重高估(实际默认只有 16384 个),
+       用户按这个数字设 -c 就会撞到端口耗尽。 */
+    long long local_ports = 60000;
+    int       range_known = 0;
+#if defined(_WIN32)
+    local_ports = 16384;          /* Windows 默认动态端口 49152-65535 */
+#elif defined(__APPLE__)
+    local_ports = 16384;          /* macOS 默认 49152-65535, 需 sysctl 调整 */
+#endif
+#ifdef __linux__
+    {
+        FILE *fp = fopen("/proc/sys/net/ipv4/ip_local_port_range", "r");
+        if (fp) {
+            int lo = 0, hi = 0;
+            if (fscanf(fp, "%d %d", &lo, &hi) == 2 && hi > lo) {
+                printf("本地端口范围    : %d - %d (共 %d 个)\n", lo, hi, hi - lo + 1);
+                local_ports = (long long)(hi - lo + 1);
+                range_known = 1;
+            }
+            fclose(fp);
+        }
+    }
+#endif
+    (void)range_known;
+
+    long long quad = (long long)(cfg.nsrcs ? cfg.nsrcs : 1) * local_ports * (long long)cfg.nports;
+    printf("四元组理论容量  : 约 %lld (源IP %d × 本地端口 %lld × 目标端口 %d)\n",
+           quad, cfg.nsrcs ? cfg.nsrcs : 1, local_ports, cfg.nports);
     if (quad < cfg.max_conns)
         fprintf(stderr,
             "[警告] 四元组容量(%lld) < 目标连接数(%d), 会撞到本地端口耗尽。\n"
             "       解决: -p 扩大目标端口范围, 或 -b 绑定多个源 IP\n",
             quad, cfg.max_conns);
 
-#ifdef __linux__
-    FILE *fp = fopen("/proc/sys/net/ipv4/ip_local_port_range", "r");
-    if (fp) {
-        int lo, hi;
-        if (fscanf(fp, "%d %d", &lo, &hi) == 2)
-            printf("本地端口范围    : %d - %d (共 %d 个)\n", lo, hi, hi - lo + 1);
-        fclose(fp);
-    }
+    /* 默认动态端口偏小的平台, 主动提示怎么扩 */
+    if (local_ports <= 16384 && quad < cfg.max_conns) {
+#if defined(_WIN32)
+        fprintf(stderr,
+            "       也可先扩大动态端口范围(Windows 默认只有 16384 个):\n"
+            "         管理员 PowerShell 执行 .\\tune.ps1\n");
+#elif defined(__APPLE__)
+        fprintf(stderr,
+            "       也可先扩大动态端口范围(macOS 默认只有 16384 个):\n"
+            "         sudo sysctl -w net.inet.ip.portrange.first=1024\n");
 #endif
+    }
 
     double eta = (double)cfg.max_conns / cfg.rate;
     printf("预计建连耗时    : %.0f 秒 (%.1f 分钟), 速率 %.1f 条/秒\n",
@@ -1407,6 +1504,13 @@ int main(int argc, char **argv)
 {
     int opt;
     const char *portspec = "8000";
+
+#if defined(_WIN32)
+    if (nb_wsa_init() != 0) {
+        fprintf(stderr, "WSAStartup 失败: %d\n", WSAGetLastError());
+        return 1;
+    }
+#endif
 
     while ((opt = getopt(argc, argv, "s:p:c:r:I:T:b:B:P:n:w:t:kK:R:S:Aqo:m:Z:Y:L:M:G:?")) != -1) {
         switch (opt) {
@@ -1467,9 +1571,13 @@ int main(int argc, char **argv)
         g_dst[i].sin_port = htons((uint16_t)cfg.ports[i]);
     }
 
+#if defined(_WIN32)
+    SetConsoleCtrlHandler(win_ctrl_handler, TRUE);
+#else
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
+#endif
 
     /* 按模式补齐默认参数 */
     if (cfg.mode == MODE_CPS) {

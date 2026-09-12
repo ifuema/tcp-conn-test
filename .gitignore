@@ -1,7 +1,12 @@
 # 编译产物
 /server
 /client
+/server.exe
+/client.exe
 *.o
+
+# 交叉编译产物
+build-windows/
 
 # macOS
 .DS_Store
