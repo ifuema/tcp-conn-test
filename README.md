@@ -218,6 +218,22 @@ make windows WINCC="zig cc -target x86_64-windows-gnu" \
 > 因此不受「fd 数值必须小于 FD_SETSIZE」的限制，`FD_SETSIZE` 限制的是**条数**。
 > 本项目的 select 后端也据此用 `(fd, mask)` 数组维护关注列表，不按 fd 数值建索引。
 
+**移植踩坑（改 Windows 相关代码前请先看）**：
+
+1. **`SOCKET` 是 typedef，不是宏**。别用 `#ifndef SOCKET` 做平台判断 —— Winsock 的
+   `SOCKET` 定义为 `UINT_PTR`，`#ifndef` 判断会成立，于是 `#define SOCKET int`
+   把真正的 64 位类型覆盖掉，后续所有 `SOCKET` 声明都被悄悄改成 int
+   （表现为 `FD_SET` 报 `-Wsign-compare`）。
+2. **`getsockopt(SO_ERROR)` 返回的是 WSA 错误码**（如 10061），不是 errno。
+   不翻译的话失败归因会全部落空，报告里只有一堆 `Unknown error`。
+   本项目统一走 `nb_so_error()` 翻译。
+3. **别用 `WSAPoll` 探测连接失败**：微软已记录该函数在连接失败时不回报 `POLLERR`，
+   会把「服务端没起」误报成「超时」。用 `select` 的写集合 + 异常集合代替。
+4. **`closesocket` 而非 `close`、`ioctlsocket(FIONBIO)` 而非 `fcntl`、
+   `SIO_KEEPALIVE_VALS` 而非 `TCP_KEEPIDLE`、服务端用 `SO_EXCLUSIVEADDRUSE`** ——
+   这些都在 `wincompat.h` 里包好了，新代码请复用，不要再手写 `#ifdef`。
+5. **别在 Windows 上假设 6 万个本地端口**：默认动态端口只有 16384 个。
+
 ### 路线三：Docker
 
 ```powershell
