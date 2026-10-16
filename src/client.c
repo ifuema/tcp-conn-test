@@ -1319,7 +1319,8 @@ static void diagnose_conn(void)
     uint64_t tf      = g_st.failed;
 
     if (tmo * 2 >= tf) {
-        EMIT("  失败以「超时」为主 (%llu/%llu) —— SYN 发出后没有任何响应\n", tmo, tf);
+        EMIT("  失败以「超时」为主 (%llu/%llu) —— SYN 发出后没有任何响应\n",
+             (unsigned long long)tmo, (unsigned long long)tf);
         if (g_st.peer_closed == 0) {
             EMIT("  判定  : 链路侧 NAT/CGNAT 会话配额已用满\n");
             EMIT("  依据  :\n");
